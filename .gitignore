@@ -1,5 +1,9 @@
-resource/
 .DS_Store
-output/
 __pycache__/
 *.py[cod]
+
+resource/*
+!resource/README.md
+
+output/*
+!output/README.md

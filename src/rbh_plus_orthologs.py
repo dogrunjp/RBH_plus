@@ -11,13 +11,12 @@ import argparse
 import os
 import sys
 from collections import defaultdict
-import pandas as pd
-import numpy as np
 
 COLS = [
     "qseqid","sseqid","pident","length","evalue","bitscore",
     "qlen","slen","qstart","qend","sstart","send"
 ]
+
 
 def read_id_list(path):
     ids = []
@@ -28,51 +27,97 @@ def read_id_list(path):
                 ids.append(t)
     return set(ids)
 
-def load_hits_table(path, min_cols=len(COLS)):
-    # auto-detect columns count (but expect outfmt 6 with these 12 fields)
-    df = pd.read_csv(path, sep="\t", header=None, comment="#", low_memory=False)
-    if df.shape[1] < min_cols:
-        raise ValueError(f"{path}: expected >= {min_cols} columns (outfmt 6 with qlen/slen/coords). Got {df.shape[1]}")
-    df = df.iloc[:, :len(COLS)]
-    df.columns = COLS
-    # types
-    df["length"]   = pd.to_numeric(df["length"], errors="coerce")
-    df["evalue"]   = pd.to_numeric(df["evalue"], errors="coerce")
-    df["bitscore"] = pd.to_numeric(df["bitscore"], errors="coerce")
-    df["qlen"]     = pd.to_numeric(df["qlen"], errors="coerce")
-    df["slen"]     = pd.to_numeric(df["slen"], errors="coerce")
-    # coverage & sanity
-    df["cov_q"] = df["length"] / df["qlen"].replace(0, np.nan)
-    df["cov_s"] = df["length"] / df["slen"].replace(0, np.nan)
-    df["cov_both"] = df[["cov_q","cov_s"]].min(axis=1)
-    # length ratio sanity (min(qlen,slen)/max(qlen,slen))
-    lr = (df[["qlen","slen"]].min(axis=1) / df[["qlen","slen"]].max(axis=1))
-    df["len_ratio"] = lr
-    return df
 
-def subset_cross_species(df, ids_q, ids_s):
-    df2 = df[df["qseqid"].isin(ids_q) & df["sseqid"].isin(ids_s)].copy()
-    return df2
+def parse_hit_line(line):
+    cols = line.rstrip("\n").split("\t")
+    if len(cols) < len(COLS):
+        return None
+    qseqid, sseqid = cols[0], cols[1]
+    try:
+        pident = float(cols[2])
+        length = float(cols[3])
+        evalue = float(cols[4])
+        bitscore = float(cols[5])
+        qlen = float(cols[6])
+        slen = float(cols[7])
+    except ValueError:
+        return None
+    cov_q = length / qlen if qlen else float("nan")
+    cov_s = length / slen if slen else float("nan")
+    cov_both = min(cov_q, cov_s) if (cov_q == cov_q and cov_s == cov_s) else float("nan")
+    len_ratio = min(qlen, slen) / max(qlen, slen) if max(qlen, slen) > 0 else 0.0
+    return {
+        "qseqid": qseqid,
+        "sseqid": sseqid,
+        "pident": pident,
+        "length": length,
+        "evalue": evalue,
+        "bitscore": bitscore,
+        "qlen": qlen,
+        "slen": slen,
+        "cov_both": cov_both,
+        "len_ratio": len_ratio,
+    }
 
-def best_hits(df_cross, metric="bitscore"):
-    # For each query, pick subject with maximum metric
-    # returns dict: q -> (s, score)
-    idx = df_cross.groupby("qseqid")[metric].idxmax()
-    best_df = df_cross.loc[idx, ["qseqid","sseqid",metric]].copy()
-    best_df = best_df.rename(columns={metric:"score"})
-    best = dict(zip(best_df["qseqid"], zip(best_df["sseqid"], best_df["score"])))
+
+def pass_filters(hit, min_cov, len_ratio, min_align, evalue):
+    return (
+        hit["evalue"] <= evalue
+        and hit["cov_both"] >= min_cov
+        and hit["len_ratio"] >= len_ratio
+        and hit["length"] >= min_align
+    )
+
+
+def best_hits(path, ids_q, ids_s, min_cov, len_ratio, min_align, evalue):
+    best = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            hit = parse_hit_line(line)
+            if not hit:
+                continue
+            if hit["qseqid"] not in ids_q or hit["sseqid"] not in ids_s:
+                continue
+            if not pass_filters(hit, min_cov, len_ratio, min_align, evalue):
+                continue
+            prev = best.get(hit["qseqid"])
+            if prev is None or hit["bitscore"] > prev[1] or (
+                hit["bitscore"] == prev[1] and hit["evalue"] < prev[2]
+            ):
+                best[hit["qseqid"]] = (hit["sseqid"], hit["bitscore"], hit["evalue"])
     return best
+
+
+def index_filtered_hits(path, ids_from, ids_to, min_cov, len_ratio, min_align, evalue):
+    index = defaultdict(list)
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            hit = parse_hit_line(line)
+            if not hit:
+                continue
+            if hit["qseqid"] not in ids_from or hit["sseqid"] not in ids_to:
+                continue
+            if not pass_filters(hit, min_cov, len_ratio, min_align, evalue):
+                continue
+            index[hit["sseqid"]].append((hit["qseqid"], hit["bitscore"]))
+    return index
+
 
 def rbh_pairs(bestAB, bestBA):
     anchors = []
-    for a,(b,score_ab) in bestAB.items():
+    for a, (b, score_ab, _) in bestAB.items():
         if b in bestBA:
-            a2,score_ba = bestBA[b]
+            a2, score_ba, _ = bestBA[b]
             if a2 == a:
-                anchors.append((a,b,float(score_ab)))
+                anchors.append((a, b, float(score_ab)))
     return anchors
 
-def expand_inparalogs(df_all, anchor, tau, min_cov, len_ratio, min_align, evalue):
+
+def expand_inparalogs(index_ab, index_ba, anchor, tau):
     """
     anchor: (a, b, score_ab)
     For A-side expansion: pick all a' such that hit(a', b) exists and passes thresholds
@@ -83,61 +128,31 @@ def expand_inparalogs(df_all, anchor, tau, min_cov, len_ratio, min_align, evalue
     a, b, score_ab = anchor
     thr = tau * score_ab
 
-    # A' : q in A, s == b
-    df_a = df_all[(df_all["sseqid"] == b)]
-    # thresholds
-    df_a = df_a[
-        (df_a["bitscore"] >= thr) &
-        (df_a["cov_both"] >= min_cov) &
-        (df_a["len_ratio"] >= len_ratio) &
-        (df_a["length"] >= min_align) &
-        (df_a["evalue"] <= evalue)
-    ]
-    A_members = set(df_a["qseqid"].tolist())
-    if a not in A_members:
-        A_members.add(a)
+    A_members = {a}
+    for qid, score in index_ab.get(b, []):
+        if score >= thr:
+            A_members.add(qid)
 
-    # B' : q in B, s == a
-    df_b = df_all[(df_all["sseqid"] == a)]
-    df_b = df_b[
-        (df_b["bitscore"] >= thr) &
-        (df_b["cov_both"] >= min_cov) &
-        (df_b["len_ratio"] >= len_ratio) &
-        (df_b["length"] >= min_align) &
-        (df_b["evalue"] <= evalue)
-    ]
-    B_members = set(df_b["qseqid"].tolist())
-    if b not in B_members:
-        B_members.add(b)
+    B_members = {b}
+    for qid, score in index_ba.get(a, []):
+        if score >= thr:
+            B_members.add(qid)
 
     return sorted(A_members), sorted(B_members)
 
-def compute_pairwise_groups(df, ids_A, ids_B, tau, min_cov, len_ratio, min_align, evalue, pair_tag):
-    # cross-subsets
-    AB = subset_cross_species(df, ids_A, ids_B)
-    BA = subset_cross_species(df, ids_B, ids_A)
 
-    # apply basic filters up front to stabilize best hits
-    filt = lambda x: x[
-        (x["evalue"] <= evalue) &
-        (x["cov_both"] >= min_cov) &
-        (x["len_ratio"] >= len_ratio) &
-        (x["length"] >= min_align)
-    ].copy()
-    ABf = filt(AB)
-    BAf = filt(BA)
-
-    bestAB = best_hits(ABf, metric="bitscore")
-    bestBA = best_hits(BAf, metric="bitscore")
+def compute_pairwise_groups(path, ids_A, ids_B, tau, min_cov, len_ratio, min_align, evalue, pair_tag):
+    bestAB = best_hits(path, ids_A, ids_B, min_cov, len_ratio, min_align, evalue)
+    bestBA = best_hits(path, ids_B, ids_A, min_cov, len_ratio, min_align, evalue)
     anchors = rbh_pairs(bestAB, bestBA)
 
+    index_ab = index_filtered_hits(path, ids_A, ids_B, min_cov, len_ratio, min_align, evalue)
+    index_ba = index_filtered_hits(path, ids_B, ids_A, min_cov, len_ratio, min_align, evalue)
+
     groups = []
-    for i,(a,b,score_ab) in enumerate(anchors, start=1):
+    for i, (a, b, score_ab) in enumerate(anchors, start=1):
         A_members, B_members = expand_inparalogs(
-            pd.concat([ABf, BAf], ignore_index=True),
-            (a,b,score_ab),
-            tau=tau, min_cov=min_cov, len_ratio=len_ratio,
-            min_align=min_align, evalue=evalue
+            index_ab, index_ba, (a, b, score_ab), tau=tau
         )
         groups.append({
             "pair": pair_tag,
@@ -149,6 +164,7 @@ def compute_pairwise_groups(df, ids_A, ids_B, tau, min_cov, len_ratio, min_align
             "B_members": B_members,
         })
     return groups
+
 
 def write_groups(groups, outdir, pair_tag):
     path = os.path.join(outdir, f"{pair_tag}.rbh_inparalog.tsv")
@@ -165,8 +181,15 @@ def write_groups(groups, outdir, pair_tag):
             "A_members": ",".join(g["A_members"]),
             "B_members": ",".join(g["B_members"]),
         })
-    pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("pair\tgroup_id\tanchor_a\tanchor_b\tanchor_score\tA_count\tB_count\tA_members\tB_members\n")
+        for row in rows:
+            handle.write(
+                f"{row['pair']}\t{row['group_id']}\t{row['anchor_a']}\t{row['anchor_b']}\t{row['anchor_score']}\t"
+                f"{row['A_count']}\t{row['B_count']}\t{row['A_members']}\t{row['B_members']}\n"
+            )
     return path
+
 
 def build_mapping_to_target(groups, A_label, T_label):
     """
@@ -176,17 +199,16 @@ def build_mapping_to_target(groups, A_label, T_label):
     """
     amap = defaultdict(set)
     for g in groups:
-        # A_members map to B_members
         for a in g["A_members"]:
             for t in g["B_members"]:
                 amap[a].add(t)
-    # sort
-    return {a: sorted(list(v)) for a,v in amap.items()}
+    return {a: sorted(list(v)) for a, v in amap.items()}
+
 
 def main():
     ap = argparse.ArgumentParser(description="RBH + in-paralog expansion (ortholog co-groups) from DIAMOND/BLAST tabular hits.")
     ap.add_argument("--hits", required=True, help="All-vs-all hits (outfmt 6) with extra fields: qlen slen qstart qend sstart send")
-    ap.add_argument("--species", action="append", nargs=2, metavar=("LABEL","ID_LIST"),
+    ap.add_argument("--species", action="append", nargs=2, metavar=("LABEL", "ID_LIST"),
                     help="Species label and 1-column file of protein IDs. Use labels like A, B, T etc. Example: --species A arabidopsis.ids")
     ap.add_argument("--pairs", nargs="+", required=True,
                     help="Pairs to compute as LabelX:LabelY (direction-agnostic). Example: A:B A:T B:T")
@@ -200,7 +222,6 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    # species maps
     if not args.species or len(args.species) < 2:
         print("ERROR: Provide at least two --species LABEL ID_LIST pairs.", file=sys.stderr)
         sys.exit(1)
@@ -209,14 +230,10 @@ def main():
     for label, idfile in args.species:
         label_to_ids[label] = read_id_list(idfile)
 
-    # load table
-    df = load_hits_table(args.hits)
-
-    # compute groups for requested pairs
     pair_groups = {}
     for pair_tag in args.pairs:
         try:
-            x,y = pair_tag.split(":")
+            x, y = pair_tag.split(":")
         except ValueError:
             print(f"ERROR: pair must be LabelX:LabelY, got {pair_tag}", file=sys.stderr)
             sys.exit(1)
@@ -224,7 +241,7 @@ def main():
             print(f"ERROR: unknown species label in {pair_tag}. Known: {list(label_to_ids.keys())}", file=sys.stderr)
             sys.exit(1)
         groups = compute_pairwise_groups(
-            df,
+            args.hits,
             label_to_ids[x], label_to_ids[y],
             tau=args.tau, min_cov=args.min_cov, len_ratio=args.len_ratio,
             min_align=args.min_align, evalue=args.evalue,
@@ -234,8 +251,6 @@ def main():
         path = write_groups(groups, args.out, f"{x}:{y}")
         print(f"[OK] Wrote groups: {path}")
 
-    # Optional: if we have A:T and/or B:T pairs, emit mapping tables
-    # Detect target label 'T' if provided as species label; else skip
     labels = set(label_to_ids.keys())
     if "T" in labels:
         for src in labels - {"T"}:
@@ -248,6 +263,7 @@ def main():
                     for a, tgts in sorted(mapping.items()):
                         f.write(f"{a}\t{','.join(tgts)}\n")
                 print(f"[OK] Wrote mapping {src}->T: {outp}")
+
 
 if __name__ == "__main__":
     main()

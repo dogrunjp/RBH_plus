@@ -66,6 +66,100 @@ python3 src/rbh_plus_orthologs.py \
 - `{A}:{B}.rbh_inparalog.tsv`: ペアごとの ortholog group
 - `map_{src}_to_T.tsv`: `T` ラベルを指定した場合の target への対応表
 
+## ヒトからハダカデバネズミへの対応表の作成例
+
+ヒトとハダカデバネズミ（Taxonomy ID: 10181, 学名: Heterocephalus glaber）のプロテオーム FASTA がある場合、次のように実行すると対応表を作成できます。
+
+```bash
+chmod +x src/run_human_to_hglaber.sh
+./src/run_human_to_hglaber.sh \
+  /path/to/human_proteins.faa \
+  /path/to/hglaber_proteins.faa \
+  ./output/human_hglaber
+```
+
+出力先の [output/human_hglaber](output/human_hglaber) 配下に、以下のファイルが生成されます。
+
+- `map_H_to_T.tsv`: ヒト ID からハダカデバネズミ ID への対応表
+- `pathlift_H_to_T.tsv`: PathLift の `provided_table` として読める対応表
+- `human_hglaber_hits.tsv`: DIAMOND の all-vs-all hits
+- `human.ids`, `hglaber.ids`: 各種の ID リスト
+
+必要に応じて、同じ手順で別の種間でも再利用できます。
+
+### この作成例のために行った内部実装の変更
+
+今回の作成例では、次のコード変更と追加を行っています。
+
+- `src/rbh_plus_orthologs.py`: DIAMOND の検索結果全体を pandas の
+  `DataFrame` に読み込む実装から、TSV を1行ずつ読み込み、条件を満たしたヒットの
+  ベストヒットと in-paralog 展開用インデックスだけを保持する実装に変更しました。
+  ヒトとハダカデバネズミの all-vs-all 検索結果は大きくなるため、解析時のメモリ消費を
+  抑える必要があったためです。これに伴い、このスクリプトでの pandas／NumPy 依存も
+  なくし、結果TSVはPython標準ライブラリで出力するようにしました。
+- `src/run_human_to_hglaber.sh`: FASTAからのIDリスト作成、FASTAの結合、DIAMOND DBの
+  作成と検索、RBH + in-paralog解析、PathLift用TSVへの変換を順番に実行するラッパーを
+  追加しました。手作業による入力ファイルや種ラベル、出力先の指定間違いを避け、同じ
+  条件で対応表を再作成できるようにするためです。
+- `src/convert_rbh_to_pathlift.py`: `map_H_to_T.tsv` のカンマ区切りの対応候補を1候補1行に
+  展開し、ヒトFASTAヘッダーから遺伝子記号を取得して、PathLiftの
+  `target_id`, `source_symbol`, `source_pid` 形式に変換する処理を追加しました。
+  RBHの元の出力形式をPathLiftへ直接入力できないために必要です。また、任意の
+  protein-to-gene TSVを使ってハダカデバネズミのprotein accessionをgene IDへ変換し、
+  複数アイソフォームを遺伝子単位にまとめられるようにしました。
+
+## PathLift 用TSVへの変換
+
+`convert_rbh_to_pathlift.py` は `map_*_to_T.tsv` のカンマ区切り候補を1候補1行に展開し、
+source FASTA のヘッダーから遺伝子記号を補完します。出力列は
+`target_id`, `source_symbol`, `source_pid` です。
+
+```bash
+python3 src/convert_rbh_to_pathlift.py \
+  --mapping output/human_hglaber/map_H_to_T.tsv \
+  --source-fasta data/human_proteins.faa \
+  --out output/human_hglaber/pathlift_H_to_T.tsv
+```
+
+この実行では対象ID（`XP_...` / `NP_...`）をprotein accessionのまま出力します。
+PathLiftで遺伝子単位に集約する場合は、次のヘッダーを持つprotein-to-gene TSVを渡します。
+
+```text
+protein_id\tgene_id
+XP_004875082.1\t100123456
+```
+
+```bash
+python3 src/convert_rbh_to_pathlift.py \
+  --mapping output/human_hglaber/map_H_to_T.tsv \
+  --source-fasta data/human_proteins.faa \
+  --target-id-map data/hglaber_protein_to_gene.tsv \
+  --out output/human_hglaber/pathlift_H_to_T.tsv
+```
+
+`run_human_to_hglaber.sh`では変換も自動実行します。protein-to-gene TSVがある場合は
+第4引数に指定できます。
+
+```bash
+./src/run_human_to_hglaber.sh \
+  data/human_proteins.faa \
+  data/hglaber_proteins.faa \
+  output/human_hglaber \
+  data/hglaber_protein_to_gene.tsv
+```
+
+PathLift recipeの列指定は次のとおりです。
+
+```yaml
+provided_table:
+  path: /path/to/pathlift_H_to_T.tsv
+  format: tsv
+  columns:
+    target_id: target_id
+    source_symbol: source_symbol
+    source_pid: source_pid
+```
+
 ## 注意
 
 - `resource/` と `output/` は Git 管理対象外です。
